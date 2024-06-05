@@ -20,7 +20,7 @@ import           Text.Read                               (readEither)
 
 import qualified HStream.Kafka.Server.Config.KafkaConfig as KC
 import           HStream.Kafka.Server.Config.Types
-import           HStream.Store                           (Compression (..))
+import qualified Kafka.Storage                           as S
 
 -------------------------------------------------------------------------------
 
@@ -40,10 +40,9 @@ parseJSONToOptions CliOptions{..} obj = do
   nodeLogWithColor  <- nodeCfgObj .:? "log-with-color" .!= True
 
   -- Kafka config
-  -- TODO: generate Parser from KafkaBrokerConfigs
-  let !_disableAutoCreateTopic = cliDisableAutoCreateTopic
-  let updateBrokerConfigs cfg = cfg {KC.autoCreateTopicsEnable=KC.AutoCreateTopicsEnable $ not _disableAutoCreateTopic}
-  !_kafkaBrokerConfigs <- updateBrokerConfigs <$> KC.parseBrokerConfigs nodeCfgObj
+  brokerConfigs <- KC.parseBrokerConfigs nodeCfgObj
+  let !_kafkaBrokerConfigs = either (errorWithoutStackTrace . show) id $ KC.updateConfigs brokerConfigs cliBrokerProps
+
   metricsPort   <- nodeCfgObj .:? "metrics-port" .!= 9700
   let !_metricsPort = fromMaybe metricsPort cliMetricsPort
 
@@ -62,7 +61,7 @@ parseJSONToOptions CliOptions{..} obj = do
   let !_serverGossipAddress = fromMaybe _advertisedAddress (cliServerGossipAddress <|> nodeGossipAddress)
 
   let !_metaStore          = fromMaybe nodeMetaStore cliMetaStore
-  let !_compression        = fromMaybe CompressionNone cliStoreCompression
+  let !_compression        = fromMaybe S.CompressionNone cliStoreCompression
 
   let !_serverLogLevel     = fromMaybe (readWithErrLog "log-level" nodeLogLevel) cliServerLogLevel
   let !_serverLogWithColor = nodeLogWithColor || cliServerLogWithColor
@@ -109,18 +108,21 @@ parseJSONToOptions CliOptions{..} obj = do
   storageCfg <- nodeCfgObj .:? "storage" .!= mempty
   fetchReaderTimeout <- storageCfg .:? "fetch-reader-timeout" .!= 50
   fetchMaxLen <- storageCfg .:? "fetch-maxlen" .!= 1000
+  scdEnabled <- storageCfg .:? "scd-enabled" .!= False
+  localScdEnabled <- storageCfg .:? "local-scd-enabled" .!= False
+  stickyCopysets <- storageCfg .:? "sticky-copysets" .!= False
   let _storage = StorageOptions{..}
 
   -- SASL config
   nodeEnableSaslAuth <- nodeCfgObj .:? "enable-sasl" .!= False
   let !_enableSaslAuth = cliEnableSaslAuth || nodeEnableSaslAuth
-  let parsePlainTuple obj = do
-        username <- obj .: "username"
-        password <- obj .: "password"
+  let parsePlainTuple o = do
+        username <- o .: "username"
+        password <- o .: "password"
         return (username, password)
-  let parseMechanisms obj = do
-        mech      <- obj .: "mechanism"
-        auth_list <- obj .: "auth-list"
+  let parseMechanisms o = do
+        mech      <- o .: "mechanism"
+        auth_list <- o .: "auth-list"
         -- FIXME: more mechanisms
         if (toUpper mech) == "PLAIN" then do
           tups <- Y.withArray "auth-list" (

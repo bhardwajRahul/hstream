@@ -32,6 +32,8 @@ module HStream.Server.MetaData.Types
   , renderQueryStatusToTable
   , renderViewInfosToTable
   , renderQVRelationToTable
+  , renderTaskMetaMapToTable
+  , renderTaskIdMetaMapToTable
 
 #ifdef HStreamEnableSchema
   , hstreamColumnCatalogToColumnCatalog
@@ -47,14 +49,19 @@ module HStream.Server.MetaData.Types
   ) where
 
 import           Control.Exception                 (catches)
+import           Control.Monad                     (forM)
 import           Data.Aeson                        (FromJSON (..), ToJSON (..))
+import qualified Data.Aeson                        as Aeson
 import qualified Data.HashMap.Strict               as HM
 import           Data.Int                          (Int64)
 import qualified Data.IntMap                       as IntMap
 import           Data.IORef
 import qualified Data.List                         as L
+import           Data.Map                          (Map)
+import qualified Data.Map.Strict                   as M
 import           Data.Text                         (Text)
 import qualified Data.Text                         as T
+import qualified Data.Text.Lazy                    as TL
 import           Data.Time.Clock.System            (SystemTime (MkSystemTime),
                                                     getSystemTime)
 import qualified Data.Vector                       as V
@@ -62,11 +69,12 @@ import           Data.Word                         (Word32, Word64)
 import           GHC.Generics                      (Generic)
 import           GHC.IO                            (unsafePerformIO)
 import           GHC.Stack
-import           ZooKeeper.Types                   (ZHandle)
 
-import           Control.Monad                     (forM)
-import qualified Data.Aeson                        as Aeson
 import           HStream.Common.Server.MetaData    (rootPath)
+import           HStream.Common.ZookeeperClient    (ZookeeperClient)
+import           HStream.IO.Types                  (TaskIdMeta (..),
+                                                    TaskInfo (..),
+                                                    TaskMeta (..))
 import qualified HStream.Logger                    as Log
 import           HStream.MetaStore.Types           (FHandle, HasPath (..),
                                                     MetaHandle,
@@ -79,6 +87,7 @@ import qualified HStream.Server.HStreamApi         as API
 import           HStream.Server.MetaData.Exception
 import           HStream.Server.Types              (SubscriptionWrap (..))
 import qualified HStream.Store                     as S
+import           HStream.ThirdParty.Protobuf       (toRFC3339)
 import           HStream.Utils
 #ifdef HStreamUseV2Engine
 import           DiffFlow.Types
@@ -157,6 +166,27 @@ renderQVRelationToTable relations =
       rows = map (\QVRelation{..} -> [qvRelationQueryName, qvRelationViewName]) relations
    in Aeson.object ["headers" Aeson..= headers, "rows" Aeson..= rows]
 
+renderTaskMetaMapToTable :: Map Text TaskMeta -> Aeson.Value
+renderTaskMetaMapToTable mp =
+  let headers = [ "Connector Name" :: Text
+                , "Task Id"        :: Text
+                , "Task Type"      :: Text
+                , "Created Time"   :: Text
+                , "State"          :: Text
+                ]
+      rows = map getMetaInfo $ M.toList mp
+   in Aeson.object ["headers" Aeson..= headers, "rows" Aeson..= rows]
+ where
+   getMetaInfo (taskId, TaskMeta{taskInfoMeta=TaskInfo{..}, ..}) =
+     let createTime = TL.toStrict . toRFC3339 $ taskCreatedTime
+      in [taskName, taskId, T.pack . show $ taskType, createTime, T.pack . show $ taskStateMeta]
+
+renderTaskIdMetaMapToTable :: Map Text TaskIdMeta -> Aeson.Value
+renderTaskIdMetaMapToTable mp =
+  let headers = ["Connector Name" :: Text , "Task Id"]
+      rows = map (\(name, TaskIdMeta{..}) -> [name, taskIdMeta]) $ M.toList mp
+   in Aeson.object ["headers" Aeson..= headers, "rows" Aeson..= rows]
+
 type SourceStreams  = [Text]
 type SinkStream     = Text
 type RelatedStreams = (SourceStreams, SinkStream)
@@ -175,22 +205,22 @@ data ShardReaderMeta = ShardReaderMeta
     -- ^ use to record start time offset
   } deriving (Show, Generic, FromJSON, ToJSON)
 
-instance HasPath ShardReaderMeta ZHandle where
+instance HasPath ShardReaderMeta ZookeeperClient where
   myRootPath = rootPath <> "/shardReader"
   myExceptionHandler = zkExceptionHandlers ResShardReader
-instance HasPath SubscriptionWrap ZHandle where
+instance HasPath SubscriptionWrap ZookeeperClient where
   myRootPath = rootPath <> "/subscriptions"
   myExceptionHandler = zkExceptionHandlers ResSubscription
-instance HasPath QueryInfo ZHandle where
+instance HasPath QueryInfo ZookeeperClient where
   myRootPath = rootPath <> "/queries"
   myExceptionHandler = zkExceptionHandlers ResQuery
-instance HasPath ViewInfo ZHandle where
+instance HasPath ViewInfo ZookeeperClient where
   myRootPath = rootPath <> "/views"
   myExceptionHandler = zkExceptionHandlers ResView
-instance HasPath QueryStatus ZHandle where
+instance HasPath QueryStatus ZookeeperClient where
   myRootPath = rootPath <> "/queryStatus"
   myExceptionHandler = zkExceptionHandlers ResQuery
-instance HasPath QVRelation ZHandle where
+instance HasPath QVRelation ZookeeperClient where
   myRootPath = rootPath <> "/qvRelation"
 
 instance HasPath ShardReaderMeta RHandle where
@@ -317,7 +347,7 @@ groupbyStores = unsafePerformIO $ newIORef HM.empty
 --------------------------------------------------------------------------------
 
 #ifdef HStreamEnableSchema
-instance HasPath SQL.Schema ZHandle where
+instance HasPath SQL.Schema ZookeeperClient where
   myRootPath = rootPath <> "/schemas"
 instance HasPath SQL.Schema FHandle where
   myRootPath = "schemas"

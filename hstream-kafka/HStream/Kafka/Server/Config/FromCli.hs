@@ -15,7 +15,9 @@ module HStream.Kafka.Server.Config.FromCli
   ) where
 
 import qualified Data.Attoparsec.Text              as AP
+import           Data.Bifunctor                    (second)
 import           Data.ByteString                   (ByteString)
+import           Data.Map.Strict                   (Map)
 import qualified Data.Map.Strict                   as Map
 import qualified Data.Set                          as Set
 import           Data.Text                         (Text)
@@ -33,8 +35,7 @@ import           Z.Data.CBytes                     (CBytes)
 
 import           HStream.Kafka.Server.Config.Types
 import qualified HStream.Logger                    as Log
-import           HStream.Store                     (Compression (..))
-import           HStream.Store.Logger              (LDLogLevel (..))
+import qualified Kafka.Storage                     as S
 
 -------------------------------------------------------------------------------
 
@@ -78,19 +79,19 @@ cliOptionsParser = do
 
   cliServerLogLevel     <- optional logLevelParser
   cliServerLogWithColor <- logWithColorParser
+  cliServerFileLog      <- optional fileLoggerSettingsParser
   cliServerLogFlushImmediately <- logFlushImmediatelyParser
-  cliServerFileLog <- optional fileLoggerSettingsParser
 
   cliServerGossipAddress <- optional serverGossipAddressParser
   cliServerGossipPort    <- optional serverGossipPortParser
-  cliSeedNodes          <- optional seedNodesParser
+  cliSeedNodes           <- optional seedNodesParser
 
   cliServerAdvertisedAddress      <- optional advertisedAddressParser
   cliServerAdvertisedListeners    <- advertisedListenersParser
   cliListenersSecurityProtocolMap <- listenersSecurityProtocolMapParser
 
-  cliLdLogLevel      <- optional ldLogLevelParser
-  cliStoreConfigPath <- storeConfigPathParser
+  cliLdLogLevel         <- optional ldLogLevelParser
+  cliStoreConfigPath    <- storeConfigPathParser
   cliEnableTls          <- enableTlsParser
   cliTlsKeyPath         <- optional tlsKeyPathParser
   cliTlsCertPath        <- optional tlsCertPathParser
@@ -101,7 +102,7 @@ cliOptionsParser = do
   cliEnableSaslAuth <- enableSaslAuthParser
   cliEnableAcl      <- enableAclParser
 
-  cliDisableAutoCreateTopic <- disableAutoCreateTopicParser
+  cliBrokerProps    <- brokerConfigsParser
 
   cliExperimentalFeatures <- O.many experimentalFeatureParser
 
@@ -117,7 +118,6 @@ parseAdvertisedListeners =
                   address <- AP.takeTill (== ':')
                   AP.char ':'
                   port <- AP.decimal
-                  AP.endOfInput
                   return (key, Set.singleton Listener{ listenerAddress = address, listenerPort = port})
    in (Map.fromListWith Set.union <$>) . AP.parseOnly (parser `AP.sepBy` AP.char ',')
 
@@ -248,7 +248,7 @@ seedNodesParser = strOption
   <> metavar "ADDRESS"
   <> help "host:port pairs of seed nodes, separated by commas (,)"
 
-storeCompressionParser :: O.Parser Compression
+storeCompressionParser :: O.Parser S.Compression
 storeCompressionParser = option auto
   $ long "store-compression"
   <> metavar "none | lz4 | lz4hc"
@@ -270,7 +270,7 @@ logFlushImmediatelyParser = O.switch
    $ long "log-flush-immediately"
   <> help "Flush immediately after logging, this may help debugging"
 
-ldLogLevelParser :: O.Parser LDLogLevel
+ldLogLevelParser :: O.Parser S.LDLogLevel
 ldLogLevelParser = option auto
   $  long "store-log-level"
   <> metavar "[critical|error|warning|notify|info|debug|spew]"
@@ -292,14 +292,23 @@ enableAclParser = flag False True
   $  long "enable-acl"
   <> help "Enable ACL authorization"
 
-disableAutoCreateTopicParser :: O.Parser Bool
-disableAutoCreateTopicParser = flag False True
-  $  long "disable-auto-create-topic"
-  <> help "Disable auto create topic"
-
 experimentalFeatureParser :: O.Parser ExperimentalFeature
 experimentalFeatureParser = option parseExperimentalFeature $
   long "experimental" <> metavar "ExperimentalFeature"
+
+brokerConfigsParser :: O.Parser (Map Text Text)
+brokerConfigsParser = Map.fromList <$> O.many
+  ( O.option propertyReader
+     ( O.long "prop"
+    <> metavar "KEY=VALUE"
+    <> help "Broker property"
+     )
+  )
+ where
+  propertyReader :: O.ReadM (Text, Text)
+  propertyReader = O.eitherReader $ \kv ->
+    let (k, v) = second tail $ span (/= '=') kv
+     in Right (T.pack k, T.pack v)
 
 -------------------------------------------------------------------------------
 

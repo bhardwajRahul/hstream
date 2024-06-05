@@ -89,9 +89,9 @@ createIOTask worker@Worker{..} name typ target cfg = do
 createIOTaskFromTaskInfo
   :: HasCallStack
   => Worker -> T.Text -> TaskInfo -> IOOptions -> Bool -> Bool -> Bool -> IO ()
-createIOTaskFromTaskInfo worker@Worker{..} taskId taskInfo@TaskInfo {..}
+createIOTaskFromTaskInfo Worker{..} taskId taskInfo@TaskInfo {..}
                          ioOptions cleanIfExists createMetaData enableCheck = do
-  getIOTask worker taskName >>= \case
+  M.getIOTaskFromName workerHandle taskName >>= \case
     Nothing -> pure ()
     Just _  -> do
       if cleanIfExists
@@ -106,7 +106,7 @@ createIOTaskFromTaskInfo worker@Worker{..} taskId taskInfo@TaskInfo {..}
 
   when createMetaData $ M.createIOTaskMeta workerHandle taskName taskId taskInfo
   C.modifyMVar_ ioTasksM $ \ioTasks -> do
-    -- FIXME: already check ioTask exist in `getIOTask worker` step, no need check again
+    -- FIXME: already check ioTask exist in `getIOTaskFromName` step, no need check again
     case HM.lookup taskName ioTasks of
       Just _ -> throwIO $ HE.ConnectorExists taskName
       Nothing -> do
@@ -132,9 +132,8 @@ showIOTask_ worker@Worker{..} name = do
     Nothing -> throwIO $ HE.ConnectorNotFound name
     Just c  -> do
       dockerStatus <- getDockerStatus task
-      let connector = convertTaskMeta c
+      let connector = convertTaskMeta (taskId, c)
       return $ connector { API.connectorOffsets = taskOffsets
-                         , API.connectorTaskId  = taskId
                          , API.connectorNode    = fromMaybe "" (getServerNode connectorConfig)
                          , API.connectorConfig  = getConnectorConfig connectorConfig
                          , API.connectorImage   = tcImage taskConfig
@@ -220,9 +219,21 @@ updateConnectorConfig worker name config = do
             <> ", new config:" <> Log.buildString' newConnCfg
           return True
 
+-- WARNING: This function uses only cache in memory, which can be
+--          outdated, especially under complex cluster circumstances.
+--          Please be very careful when using this function, e.g. check
+--          if a task already exists before creating it.
+--          And remember there are <name -> task id -> task meta> mappings
+--          in meta store, and the latter is never cleaned up!!!
 getIOTask :: Worker -> T.Text -> IO (Maybe IOTask)
 getIOTask Worker{..} name = HM.lookup name <$> C.readMVar ioTasksM
 
+-- WARNING: This function uses only cache in memory, which can be
+--          outdated, especially under complex cluster circumstances.
+--          Please be very careful when using this function, e.g. check
+--          if a task already exists before creating it.
+--          And remember there are <name -> task id -> task meta> mappings
+--          in meta store, and the latter is never cleaned up!!!
 getIOTask_ :: Worker -> T.Text -> IO IOTask
 getIOTask_ Worker{..} name = do
   ioTasks <- C.readMVar ioTasksM

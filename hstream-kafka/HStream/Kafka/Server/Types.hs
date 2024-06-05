@@ -18,14 +18,16 @@ import           HStream.Kafka.Common.FetchManager       (FetchContext,
 import           HStream.Kafka.Common.OffsetManager      (OffsetManager,
                                                           initOffsetReader,
                                                           newOffsetManager)
+import qualified HStream.Kafka.Group.Group               as G
 import           HStream.Kafka.Group.GroupCoordinator    (GroupCoordinator,
                                                           mkGroupCoordinator)
+import qualified HStream.Kafka.Group.GroupOffsetManager  as GOM
 import           HStream.Kafka.Server.Config             (ServerOpts (..))
 import qualified HStream.Kafka.Server.Config.KafkaConfig as KC
 import           HStream.MetaStore.Types                 (MetaHandle (..))
 import           HStream.Stats                           (newServerStatsHolder)
 import qualified HStream.Stats                           as Stats
-import qualified HStream.Store                           as S
+import qualified Kafka.Storage                           as S
 
 data ServerContext = ServerContext
   { serverID                 :: !Word32
@@ -61,8 +63,10 @@ initServerContext opts@ServerOpts{..} gossipContext mh = do
   -- XXX: Should we add a server option to toggle Stats?
   statsHolder <- newServerStatsHolder
   epochHashRing <- initializeHashRing gossipContext
-  scGroupCoordinator <- mkGroupCoordinator mh ldclient _serverID
 
+  let groupConfigs  = brokerConfigToGroupConfig _kafkaBrokerConfigs
+      offsetConfigs = brokerConfigToOffsetConfig _kafkaBrokerConfigs
+  scGroupCoordinator <- mkGroupCoordinator mh ldclient _serverID offsetConfigs groupConfigs
   -- must be initialized later
   offsetManager <- newOffsetManager ldclient
   -- Trick to avoid use maybe, must be initialized later
@@ -72,7 +76,7 @@ initServerContext opts@ServerOpts{..} gossipContext mh = do
   authorizer <- case _enableAcl of
     False -> return $ AuthorizerObject @AuthorizerObject Nothing
     True  -> case mh of
-      ZkHandle zkHandle -> do
+      ZKHandle zkHandle -> do
         x <- newAclAuthorizer (pure zkHandle)
         initAclAuthorizer x
         return $ AuthorizerObject (Just x)
@@ -112,3 +116,15 @@ initConnectionContext sc = do
   !fc <- initFetchContext (scLDClient sc)
 
   pure sc{scOffsetManager = om, fetchCtx = fc}
+
+brokerConfigToOffsetConfig :: KC.KafkaBrokerConfigs -> GOM.OffsetConfig
+brokerConfigToOffsetConfig KC.KafkaBrokerConfigs{..} =
+  GOM.OffsetConfig {
+    offsetsTopicReplicationFactor = offsetsTopicReplication._value
+  }
+
+brokerConfigToGroupConfig :: KC.KafkaBrokerConfigs -> G.GroupConfig
+brokerConfigToGroupConfig KC.KafkaBrokerConfigs{..} =
+  G.GroupConfig {
+    groupInitialRebalanceDelay = groupInitialRebalanceDelay._value
+  }

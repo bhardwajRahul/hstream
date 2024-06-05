@@ -11,17 +11,16 @@ module HStream.Common.Server.Lookup
   ) where
 
 import           Control.Concurrent.STM
-import           Control.Exception                (SomeException (..), throwIO,
-                                                   try)
+import           Control.Exception                (SomeException (..), try)
 import           Data.List                        (find)
 import           Data.Text                        (Text)
 import qualified Data.Vector                      as V
 
 import           HStream.Common.ConsistentHashing (getResNode)
-import           HStream.Common.Server.HashRing   (LoadBalanceHashRing)
+import           HStream.Common.Server.HashRing   (LoadBalanceHashRing,
+                                                   readLoadBalanceHashRing)
 import           HStream.Common.Server.MetaData   (TaskAllocation (..))
 import           HStream.Common.Types             (fromInternalServerNodeWithKey)
-import qualified HStream.Exception                as HE
 import           HStream.Gossip                   (GossipContext, getMemberList)
 import qualified HStream.Logger                   as Log
 import qualified HStream.MetaStore.Types          as M
@@ -29,9 +28,8 @@ import qualified HStream.Server.HStreamApi        as A
 
 lookupNode :: LoadBalanceHashRing -> Text -> Maybe Text -> IO A.ServerNode
 lookupNode loadBalanceHashRing key advertisedListenersKey = do
-  (_, hashRing) <- readTVarIO loadBalanceHashRing
-  theNode <- getResNode hashRing key advertisedListenersKey
-  return theNode
+  (_, hashRing) <- atomically (readLoadBalanceHashRing loadBalanceHashRing)
+  getResNode hashRing key advertisedListenersKey
 
 lookupNodePersist
   :: M.MetaHandle
@@ -47,7 +45,7 @@ lookupNodePersist metaHandle gossipContext loadBalanceHashRing
   -- or not
   M.getMetaWithVer @TaskAllocation metaId metaHandle >>= \case
     Nothing -> do
-      (epoch, hashRing) <- readTVarIO loadBalanceHashRing
+      (epoch, hashRing) <- atomically (readLoadBalanceHashRing loadBalanceHashRing)
       theNode <- getResNode hashRing key advertisedListenersKey
       try (M.insertMeta @TaskAllocation
              metaId
@@ -66,11 +64,7 @@ lookupNodePersist metaHandle gossipContext loadBalanceHashRing
       case find ((nodeId == ) . A.serverNodeId) serverList of
         Just theNode -> return theNode
         Nothing -> do
-          (epoch', hashRing) <- atomically $ do
-              (epoch', hashRing) <- readTVar loadBalanceHashRing
-              if epoch' > epoch
-                then pure (epoch', hashRing)
-                else retry
+          (epoch', hashRing) <- atomically (readLoadBalanceHashRing loadBalanceHashRing)
           theNode' <- getResNode hashRing key advertisedListenersKey
           try (M.updateMeta @TaskAllocation metaId
                  (TaskAllocation epoch' (A.serverNodeId theNode'))

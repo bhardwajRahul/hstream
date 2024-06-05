@@ -57,6 +57,7 @@ library kafka-protocol
     Kafka.Protocol.Encoding.Encode
     Kafka.Protocol.Encoding.Internal
     Kafka.Protocol.Encoding.Parser
+    Kafka.Protocol.Encoding.Types
     Kafka.Protocol.Message.Struct
     Kafka.Protocol.Message.Total
 
@@ -121,6 +122,28 @@ benchmark kafka-protocol-bench-encoding
   default-language: Haskell2010
   ghc-options:      -threaded -rtsopts -with-rtsopts=-N
 
+library kafka-storage
+  import:             shared-properties
+  exposed-modules:    Kafka.Storage
+  other-modules:      Kafka.Storage.Logdevice
+  hs-source-dirs:     storage
+  build-tool-depends: hpp:hpp >=0.6 && <0.7
+  build-depends:
+    , base                 >=4.11 && <5
+    , bytestring
+    , deepseq
+    , hstream-common-base
+    , hstream-store
+    , text
+    , vector
+
+  default-language:   GHC2021
+  default-extensions:
+    DerivingStrategies
+    LambdaCase
+    OverloadedStrings
+    RecordWildCards
+
 library
   import:             shared-properties
   exposed-modules:
@@ -172,6 +195,9 @@ library
     HStream.Kafka.Server.Handler.Group
     HStream.Kafka.Server.Handler.Offset
     HStream.Kafka.Server.Handler.Produce
+    HStream.Kafka.Server.Handler.SparseOffset.Consume
+    HStream.Kafka.Server.Handler.SparseOffset.Offset
+    HStream.Kafka.Server.Handler.SparseOffset.Produce
     HStream.Kafka.Server.Handler.Topic
     HStream.Kafka.Server.Security.SASL
 
@@ -191,9 +217,7 @@ library
   -- -DASIO_ENABLE_BUFFER_DEBUGGING
 
   extra-libraries:    rdkafka++
-  include-dirs:
-    include /usr/local/include external/asio/asio/include include
-
+  include-dirs:       . include /usr/local/include external/asio/asio/include
   extra-lib-dirs:     /usr/local/lib
   hs-source-dirs:     .
   build-tool-depends: hsc2hs:hsc2hs
@@ -223,7 +247,7 @@ library
     , hstream-common-stats
     , hstream-gossip
     , hstream-kafka:kafka-protocol
-    , hstream-store
+    , hstream-kafka:kafka-storage
     , mtl
     , network
     , optparse-applicative
@@ -244,6 +268,7 @@ library
 
   default-language:   GHC2021
   default-extensions:
+    CPP
     DerivingStrategies
     LambdaCase
     MultiWayIf
@@ -261,13 +286,14 @@ test-suite hstream-kafka-test
     HStream.Kafka.Common.AclEntrySpec
     HStream.Kafka.Common.AclSpec
     HStream.Kafka.Common.AuthorizerSpec
+    HStream.Kafka.Common.ConfigSpec
     HStream.Kafka.Common.OffsetManagerSpec
     HStream.Kafka.Common.TestUtils
 
   hs-source-dirs:     tests
   build-depends:
     , aeson
-    , base                                           >=4.11 && <5
+    , base                          >=4.11 && <5
     , bytestring
     , containers
     , hspec
@@ -275,7 +301,8 @@ test-suite hstream-kafka-test
     , hstream-common
     , hstream-common-base
     , hstream-common-server
-    , hstream-kafka:{hstream-kafka, kafka-protocol}
+    , hstream-kafka
+    , hstream-kafka:kafka-protocol
     , hstream-store
     , http-client
     , text

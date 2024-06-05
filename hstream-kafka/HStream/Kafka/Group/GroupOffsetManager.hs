@@ -8,6 +8,7 @@ module HStream.Kafka.Group.GroupOffsetManager
   , fetchAllOffsets
   , nullOffsets
   , loadOffsetsFromStorage
+  , OffsetConfig (..)
   ) where
 
 import           Control.Exception                   (throw)
@@ -19,7 +20,7 @@ import           Data.IORef                          (IORef, modifyIORef',
 import qualified Data.Map.Strict                     as Map
 import           Data.Maybe                          (fromMaybe)
 import           Data.Set                            (Set)
-import qualified Data.Set                            as S
+import qualified Data.Set                            as Set
 import qualified Data.Text                           as T
 import qualified Data.Vector                         as V
 import           Data.Word                           (Word64)
@@ -31,8 +32,6 @@ import qualified HStream.Kafka.Common.Metrics        as M
 import           HStream.Kafka.Group.OffsetsStore    (OffsetStorage (..),
                                                       mkCkpOffsetStorage)
 import qualified HStream.Logger                      as Log
-import qualified HStream.Store                       as LD
-import qualified HStream.Store                       as S
 import qualified Kafka.Protocol                      as K
 import           Kafka.Protocol.Encoding             (KaArray (KaArray, unKaArray))
 import qualified Kafka.Protocol.Error                as K
@@ -40,6 +39,7 @@ import           Kafka.Protocol.Message              (OffsetCommitRequestPartiti
                                                       OffsetCommitResponsePartition (..),
                                                       OffsetFetchResponsePartition (..),
                                                       OffsetFetchResponseTopic (..))
+import qualified Kafka.Storage                       as S
 
 -- NOTE: All operations on the GroupMetadataManager are not concurrency-safe,
 -- and the caller needs to ensure concurrency-safety on its own.
@@ -50,15 +50,20 @@ data GroupOffsetManager = forall os. OffsetStorage os => GroupOffsetManager
   , offsetStorage :: os
   , offsetsCache  :: IORef (Map.Map TopicPartition Int64)
   , partitionsMap :: IORef (Map.Map TopicPartition S.C_LogID)
+  , offsetConfig  :: OffsetConfig
   }
+
+data OffsetConfig = OffsetConfig
+  { offsetsTopicReplicationFactor :: Int
+  } deriving (Show)
 
 -- FIXME: if we create a consumer group with groupName haven been used, call
 -- mkCkpOffsetStorage with groupName may lead us to a un-clean ckp-store
-mkGroupOffsetManager :: S.LDClient -> Int32 -> T.Text -> IO GroupOffsetManager
-mkGroupOffsetManager ldClient serverId groupName = do
+mkGroupOffsetManager :: S.LDClient -> Int32 -> T.Text -> OffsetConfig -> IO GroupOffsetManager
+mkGroupOffsetManager ldClient serverId groupName offsetConfig = do
   offsetsCache  <- newIORef Map.empty
   partitionsMap <- newIORef Map.empty
-  offsetStorage <- mkCkpOffsetStorage ldClient groupName
+  offsetStorage <- mkCkpOffsetStorage ldClient groupName offsetConfig.offsetsTopicReplicationFactor
   return GroupOffsetManager{..}
 
 loadOffsetsFromStorage :: GroupOffsetManager -> IO ()
@@ -67,7 +72,7 @@ loadOffsetsFromStorage GroupOffsetManager{..} = do
   start <- getTime Monotonic
   tpOffsets <- Map.map fromIntegral <$> loadOffsets offsetStorage groupName
   let totalPartitions = length tpOffsets
-      logIds = S.fromList $ Map.keys tpOffsets
+      logIds = Set.fromList $ Map.keys tpOffsets
   topicNumRef <- newIORef 0
   tps <- getTopicPartitions logIds [] topicNumRef
   totalTopicNum <- readIORef topicNumRef
@@ -89,10 +94,10 @@ loadOffsetsFromStorage GroupOffsetManager{..} = do
  where
    getTopicPartitions :: Set S.C_LogID -> [[(TopicPartition, S.C_LogID)]] -> IORef Int -> IO ([(TopicPartition, S.C_LogID)])
    getTopicPartitions lgs res topicNum
-     | S.null lgs = return $ concat res
+     | Set.null lgs = return $ concat res
      | otherwise = do
-         let lgId = S.elemAt 0 lgs
-         LD.logIdHasGroup ldClient lgId >>= \case
+         let lgId = Set.elemAt 0 lgs
+         S.logIdHasGroup ldClient lgId >>= \case
           True -> do
              (streamId, _) <- S.getStreamIdFromLogId ldClient lgId
              modifyIORef' topicNum (+1)
@@ -101,11 +106,11 @@ loadOffsetsFromStorage GroupOffsetManager{..} = do
                  tpWithLogId = zipWith (\(_, logId) idx -> (mkTopicPartition topicName idx, logId)) partitions ([0..])
                  res' = tpWithLogId : res
                  -- remove partition ids from lgs because they all have same streamId
-                 lgs' = lgs S.\\ S.fromList (map snd partitions)
+                 lgs' = lgs Set.\\ Set.fromList (map snd partitions)
              getTopicPartitions lgs' res' topicNum
           False -> do
             Log.warning $ "get log group from log id failed, skip this log id:" <> Log.build lgId
-            getTopicPartitions (S.delete lgId lgs) res topicNum
+            getTopicPartitions (Set.delete lgId lgs) res topicNum
 
 storeOffsets
   :: GroupOffsetManager
@@ -183,18 +188,19 @@ fetchOffsets GroupOffsetManager{..} topicName partitions = do
     , partitions = KaArray {unKaArray = Just res}
     }
  where
+   -- FIXME: hardcoded constants
    getOffset cache partitionIdx = do
      let key = mkTopicPartition topicName partitionIdx
       in case Map.lookup key cache of
            Just offset -> return $ OffsetFetchResponsePartition
              { committedOffset = offset
-             , metadata = Nothing
+             , metadata = Just ""
              , partitionIndex= partitionIdx
              , errorCode = K.NONE
              }
            Nothing -> return $ OffsetFetchResponsePartition
              { committedOffset = -1
-             , metadata = Nothing
+             , metadata = Just ""
              , partitionIndex= partitionIdx
              , errorCode = K.NONE
              -- TODO: check the error code here
@@ -208,9 +214,10 @@ fetchAllOffsets GroupOffsetManager{..} = do
   -- group offsets by TopicName
   cachedOffset <- Map.foldrWithKey foldF Map.empty <$> readIORef offsetsCache
   return . KaArray . Just . V.map makeTopic . V.fromList . Map.toList $ cachedOffset
+  -- FIXME: hardcoded constants
   where makePartition partition offset = OffsetFetchResponsePartition
                    { committedOffset = offset
-                   , metadata = Nothing
+                   , metadata = Just ""
                    , partitionIndex=partition
                    , errorCode = K.NONE
                    }

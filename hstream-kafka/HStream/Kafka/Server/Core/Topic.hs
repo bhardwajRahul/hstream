@@ -21,12 +21,14 @@ import           GHC.Stack                               (HasCallStack)
 
 import qualified HStream.Base.Time                       as BaseTime
 import qualified HStream.Kafka.Server.Config.KafkaConfig as KC
+import           HStream.Kafka.Server.Config.Types       (ServerOpts (..),
+                                                          StorageOptions (..))
 import           HStream.Kafka.Server.Types              (ServerContext (..))
 import qualified HStream.Logger                          as Log
-import qualified HStream.Store                           as S
 import qualified HStream.Utils                           as Utils
 import qualified Kafka.Protocol                          as K
 import qualified Kafka.Protocol.Error                    as K
+import qualified Kafka.Storage                           as S
 
 createTopic
   :: ServerContext
@@ -53,6 +55,9 @@ createTopic ServerContext{..} name replicationFactor numPartitions configs = do
           attrs = S.def { S.logReplicationFactor = S.defAttr1 replica
                         , S.logAttrsExtras       = extraAttr
                         , S.logBacklogDuration   = S.defAttr1 (getBacklogDuration topicConfigs)
+                        , S.logScdEnabled        = S.defAttr1 serverOpts._storage.scdEnabled
+                        , S.logLocalScdEnabled   = S.defAttr1 serverOpts._storage.localScdEnabled
+                        , S.logStickyCopySets    = S.defAttr1 serverOpts._storage.stickyCopysets
                         }
       try (S.createStream scLDClient streamId attrs) >>= \case
         Left (e :: SomeException)
@@ -119,16 +124,16 @@ createPartitions ServerContext{..} topicName newPartitionCnt ass timeoutMs valid
     case res of
        Left (e :: SomeException)
          | Just (_ :: S.NOTFOUND) <- fromException e ->
-             return . Left $ (K.UNKNOWN_TOPIC_OR_PARTITION, "The topic " <> topicName <> " does not exist")
+             return . Left $ (K.UNKNOWN_TOPIC_OR_PARTITION, "The topic '" <> topicName <> "' does not exist.")
          | otherwise -> do
              Log.fatal $ "getTotalPartitionCount for topic " <> Log.build topicName <> " failed: " <> Log.build (displayException e)
              return . Left $ (K.UNKNOWN_SERVER_ERROR, T.pack $ displayException e)
        Right oldPartitions
          | newPartitionCnt - oldPartitions < 0 -> do
-             let msg = "Topic currently has " <> show oldPartitions <> " partitions, which is higher than the requested " <> show newPartitionCnt
+             let msg = "Topic currently has " <> show oldPartitions <> " partitions, which is higher than the requested " <> show newPartitionCnt <> "."
              return . Left $ (K.INVALID_PARTITIONS, T.pack msg)
          | newPartitionCnt == oldPartitions ->
-             return . Left $ (K.INVALID_PARTITIONS, "Topic already has " <> T.pack (show oldPartitions) <> " partitions")
+             return . Left $ (K.INVALID_PARTITIONS, "Topic already has " <> T.pack (show oldPartitions) <> " partitions.")
          | otherwise -> return . Right $ newPartitionCnt - oldPartitions
 
   doCreate streamId cnt

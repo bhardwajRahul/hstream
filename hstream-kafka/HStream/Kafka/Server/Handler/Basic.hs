@@ -19,7 +19,8 @@ import           Data.Functor                                   ((<&>))
 import           Data.Int                                       (Int32)
 import qualified Data.List                                      as L
 import qualified Data.Map                                       as Map
-import qualified Data.Set                                       as S
+import           Data.Maybe                                     (fromJust)
+import qualified Data.Set                                       as Set
 import           Data.Text                                      (Text)
 import qualified Data.Text                                      as Text
 import qualified Data.Vector                                    as V
@@ -36,15 +37,16 @@ import qualified HStream.Kafka.Common.Utils                     as Utils
 import qualified HStream.Kafka.Server.Config.KafkaConfig        as KC
 import qualified HStream.Kafka.Server.Config.KafkaConfigManager as KCM
 import           HStream.Kafka.Server.Core.Topic                (createTopic)
+import qualified HStream.Kafka.Server.Handler.Topic             as K
 import           HStream.Kafka.Server.Types                     (ServerContext (..))
 import qualified HStream.Logger                                 as Log
 import qualified HStream.Server.HStreamApi                      as A
-import qualified HStream.Store                                  as S
 import qualified HStream.Utils                                  as Utils
 import qualified Kafka.Protocol.Encoding                        as K
 import qualified Kafka.Protocol.Error                           as K
 import qualified Kafka.Protocol.Message                         as K
 import qualified Kafka.Protocol.Service                         as K
+import qualified Kafka.Storage                                  as S
 
 --------------------
 -- 18: ApiVersions
@@ -105,11 +107,11 @@ handleMetadata ctx reqCtx req = do
           -- Note: authorize **DESCRIBE** for existed topics;
           --       authorize **DESCRIBE** and **CREATE** for
           --       unexisted topics.
-          let topicNames = S.fromList . V.toList $
+          let topicNames = Set.fromList . V.toList $
                 V.map (\K.MetadataRequestTopic{..} -> name) v
-          allStreamNames <- S.findStreams ctx.scLDClient S.StreamTypeTopic <&> S.fromList . L.map (Utils.cBytesToText . S.streamName)
-          let needCreate = S.toList $ topicNames S.\\ allStreamNames
-              alreadyExist = V.fromList . S.toList $ topicNames `S.intersection` allStreamNames
+          allStreamNames <- S.findStreams ctx.scLDClient S.StreamTypeTopic <&> Set.fromList . L.map (Utils.cBytesToText . S.streamName)
+          let needCreate = Set.toList $ topicNames Set.\\ allStreamNames
+              alreadyExist = V.fromList . Set.toList $ topicNames `Set.intersection` allStreamNames
               kafkaBrokerConfigs = ctx.kafkaBrokerConfigs
 
           createResp <-
@@ -121,11 +123,15 @@ handleMetadata ctx reqCtx req = do
                   ((K.simpleAuthorize (K.toAuthorizableReqCtx reqCtx) ctx.authorizer K.Res_TOPIC topic K.AclOp_DESCRIBE) &&^
                    (K.simpleAuthorize (K.toAuthorizableReqCtx reqCtx) ctx.authorizer K.Res_TOPIC topic K.AclOp_CREATE)) >>= \case
                     False -> return $ makeErrorTopicResp topic K.TOPIC_AUTHORIZATION_FAILED
-                    True  -> do
-                      ((code, _), shards) <- createTopic ctx topic (fromIntegral defaultReplicas) (fromIntegral defaultNumPartitions) Map.empty
-                      if code /= K.NONE
-                        then return $ makeErrorTopicResp topic code
-                        else mkResponse topic (V.fromList shards)
+                    True  -> case K.validateTopicName topic of
+                      Left (code, msg) -> do
+                        Log.warning $ "Auto create topic " <> Log.build topic <> " failed, error: " <> Log.build (show msg)
+                        return $ makeErrorTopicResp topic code
+                      Right _ -> do
+                        ((code, _), shards) <- createTopic ctx topic (fromIntegral defaultReplicas) (fromIntegral defaultNumPartitions) Map.empty
+                        if code /= K.NONE
+                          then return $ makeErrorTopicResp topic code
+                          else mkResponse topic (V.fromList shards)
                 return $ V.fromList resp
               else do
                 let f topic acc = makeErrorTopicResp topic K.UNKNOWN_TOPIC_OR_PARTITION : acc
@@ -217,11 +223,14 @@ handleMetadata ctx reqCtx req = do
                        <> " is too large, it should be less than "
                        <> Log.build (maxBound :: Int32)
           let (theNodeId :: Int32) = fromIntegral (A.serverNodeId theNode)
+              streamId = S.transToTopicStreamName topicName
+          -- The logReplicationFactor should not be Nothing, so we use fromJust here.
+          repfac <- fromJust . S.attrValue . S.logReplicationFactor <$> S.getStreamLogAttrs ctx.scLDClient streamId
           pure $ K.MetadataResponsePartition
                    { errorCode       = K.NONE
                    , partitionIndex  = (fromIntegral idx)
                    , leaderId        = theNodeId
-                   , replicaNodes    = K.KaArray $ Just (V.singleton theNodeId) -- FIXME: what should it be?
+                   , replicaNodes    = K.NonNullKaArray $ (V.replicate repfac theNodeId) -- FIXME: what should it be?
                    , isrNodes        = K.KaArray $ Just (V.singleton theNodeId) -- FIXME: what should it be?
                    , offlineReplicas = K.KaArray $ Just V.empty -- TODO
                    }
@@ -302,7 +311,7 @@ handleFindCoordinator ServerContext{..} reqCtx req = do
       K.simpleAuthorize (K.toAuthorizableReqCtx reqCtx) authorizer K.Res_GROUP req.key K.AclOp_DESCRIBE >>= \case
         True  -> do
           A.ServerNode{..} <- lookupKafkaPersist metaHandle gossipContext loadBalanceHashRing scAdvertisedListenersKey (KafkaResGroup req.key)
-          Log.info $ "findCoordinator for group:" <> Log.buildString' req.key <> ", result:" <> Log.buildString' serverNodeId
+          Log.info $ "findCoordinator for group:" <> Log.buildString' req.key <> ", assign to node " <> Log.buildString' serverNodeId
           return $ K.FindCoordinatorResponse {
               errorMessage=Nothing
             , nodeId=fromIntegral serverNodeId

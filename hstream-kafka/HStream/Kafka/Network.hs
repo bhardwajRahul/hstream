@@ -55,6 +55,7 @@ import           HStream.Kafka.Server.Types        (ServerContext (..),
                                                     initConnectionContext)
 import qualified HStream.Logger                    as Log
 import           Kafka.Protocol.Encoding
+import           Kafka.Protocol.Error
 import           Kafka.Protocol.Message
 import           Kafka.Protocol.Service
 
@@ -224,6 +225,7 @@ runCppServer opts sc_ mkAuthedHandlers =
     newConnectionContext conn_ctx_ptr = do
       -- Cpp per-connection context
       conn <- peek conn_ctx_ptr
+      Log.debug1 $ "New client in: " <> Log.buildString' conn.peerHost
       -- Haskell per-connection context
       sc <- initConnectionContext sc_
       newStablePtr (sc, conn)  -- Freed by C++ code
@@ -387,7 +389,7 @@ runParseIO more parser = more >>= go Nothing
         Done l r   -> pure (r, l)
         More f     -> do msg <- more
                          go (Just f) msg
-        Fail _ err -> E.throwIO $ DecodeError $ "Fail, " <> err
+        Fail _ err -> E.throwIO $ DecodeError $ (CORRUPT_MESSAGE, "Fail, " <> err)
 
 showSockAddrHost :: N.SockAddr -> String
 showSockAddrHost (N.SockAddrUnix str)            = str

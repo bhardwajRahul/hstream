@@ -1,12 +1,12 @@
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE PatternSynonyms     #-}
+#ifndef HSTREAM_SPARSE_OFFSET
+{-# LANGUAGE PatternSynonyms #-}
 
 module HStream.Kafka.Server.Handler.Offset
  ( handleOffsetCommit
  , handleOffsetFetch
  , handleListOffsets
- )
-where
+ ) where
+#endif
 
 import qualified Control.Exception                     as E
 import           Data.Int                              (Int64)
@@ -17,19 +17,17 @@ import           HStream.Kafka.Common.Acl
 import           HStream.Kafka.Common.Authorizer.Class
 import qualified HStream.Kafka.Common.KafkaException   as K
 import qualified HStream.Kafka.Common.Metrics          as Metrics
-import           HStream.Kafka.Common.OffsetManager    (getLatestOffset,
-                                                        getOffsetByTimestamp,
-                                                        getOldestOffset)
+import qualified HStream.Kafka.Common.OffsetManager    as K
 import           HStream.Kafka.Common.Resource
 import           HStream.Kafka.Common.Utils            (forKaArray, forKaArrayM)
 import qualified HStream.Kafka.Group.Group             as G
 import qualified HStream.Kafka.Group.GroupCoordinator  as GC
 import           HStream.Kafka.Server.Types            (ServerContext (..))
 import qualified HStream.Logger                        as Log
-import qualified HStream.Store                         as S
 import qualified Kafka.Protocol                        as K
 import qualified Kafka.Protocol.Error                  as K
 import qualified Kafka.Protocol.Service                as K
+import qualified Kafka.Storage                         as S
 
 --------------------
 -- 2: ListOffsets
@@ -42,11 +40,20 @@ pattern EarliestTimestamp = (-2)
 
 -- FIXME: This function does not handle any ErrorCodeException.
 --        Modify the following 'listOffsetTopicPartitions' to fix it.
-handleListOffsets :: ServerContext
-                  -> K.RequestContext
-                  -> K.ListOffsetsRequest
-                  -> IO K.ListOffsetsResponse
+#ifndef HSTREAM_SPARSE_OFFSET
+handleListOffsets
+#else
+handleListOffsetsSparseOffset
+#endif
+  :: ServerContext
+  -> K.RequestContext
+  -> K.ListOffsetsRequest
+  -> IO K.ListOffsetsResponse
+#ifndef HSTREAM_SPARSE_OFFSET
 handleListOffsets sc reqCtx req = do
+#else
+handleListOffsetsSparseOffset sc reqCtx req = do
+#endif
   topicResps <- forKaArrayM req.topics $ \listOffsetsTopic -> do
     -- [ACL] check [DESCRIBE TOPIC] for each topic
     simpleAuthorize (toAuthorizableReqCtx reqCtx) sc.authorizer Res_TOPIC listOffsetsTopic.name AclOp_DESCRIBE >>= \case
@@ -109,18 +116,31 @@ handleListOffsets sc reqCtx req = do
             , name       = listOffsetsTopic.name
             }
 
+#ifndef HSTREAM_SPARSE_OFFSET
    -- NOTE: The last offset of a partition is the offset of the upcoming
    -- message, i.e. the offset of the last available message + 1.
    getOffset logid LatestTimestamp =
-     maybe 0 (+ 1) <$> getLatestOffset sc.scOffsetManager logid
+     maybe 0 (+ 1) <$> K.getLatestOffset sc.scOffsetManager logid
    getOffset logid EarliestTimestamp =
-     fromMaybe 0 <$> getOldestOffset sc.scOffsetManager logid
+     fromMaybe 0 <$> K.getOldestOffset sc.scOffsetManager logid
    -- Return the earliest offset whose timestamp is greater than or equal to
    -- the given timestamp.
    --
    -- TODO: actually, this is not supported currently.
    getOffset logid timestamp =
-     fromMaybe (-1) <$> getOffsetByTimestamp sc.scOffsetManager logid timestamp
+     fromMaybe (-1) <$> K.getOffsetByTimestamp sc.scOffsetManager logid timestamp
+#else
+   getOffset logid LatestTimestamp =
+     maybe 0 K.calNextSparseOffset <$> K.getLatestHeadSparseOffset sc.scOffsetManager logid
+   getOffset logid EarliestTimestamp =
+     fromMaybe 0 <$> K.getOldestSparseOffset sc.scOffsetManager logid
+   -- Return the earliest offset whose timestamp is greater than or equal to
+   -- the given timestamp.
+   --
+   -- TODO: actually, this is not supported currently.
+   getOffset logid timestamp =
+     fromMaybe (-1) <$> K.getSparseOffsetByTimestamp sc.scOffsetManager logid timestamp
+#endif
 
 --------------------
 -- 8: OffsetCommit
@@ -192,7 +212,7 @@ handleOffsetFetch ServerContext{..} reqCtx req = E.handle (\(K.ErrorCodeExceptio
   simpleAuthorize (toAuthorizableReqCtx reqCtx) authorizer Res_GROUP req.groupId AclOp_DESCRIBE >>= \case
     False -> return $ makeErrorResponse K.TOPIC_AUTHORIZATION_FAILED
     True  -> do
-      group <- GC.getGroup scGroupCoordinator req.groupId
+      group_m <- GC.getGroupM scGroupCoordinator req.groupId
       case K.unKaArray req.topics of
         -- 'Nothing' means fetch offsets of ALL topics.
         -- WARNING: Offsets of unauthzed topics should not be leaked
@@ -201,11 +221,13 @@ handleOffsetFetch ServerContext{..} reqCtx req = E.handle (\(K.ErrorCodeExceptio
         -- FIXME: Better method than passing a "validate" function?
         Nothing -> do
           Log.debug $ "fetching all offsets in group:" <> Log.build req.groupId
-          topicResps <- G.fetchAllOffsets group $ \reqTopic -> do
-            -- [ACL] check [DESCRIBE TOPIC] for each topic
-            simpleAuthorize (toAuthorizableReqCtx reqCtx) authorizer Res_TOPIC reqTopic.name AclOp_DESCRIBE >>= \case
-              False -> return K.TOPIC_AUTHORIZATION_FAILED
-              True  -> return K.NONE
+          topicResps <- case group_m of
+            Nothing    -> return (K.NonNullKaArray V.empty)
+            Just group -> G.fetchAllOffsets group $ \reqTopic -> do
+              -- [ACL] check [DESCRIBE TOPIC] for each topic
+              simpleAuthorize (toAuthorizableReqCtx reqCtx) authorizer Res_TOPIC reqTopic.name AclOp_DESCRIBE >>= \case
+                False -> return K.TOPIC_AUTHORIZATION_FAILED
+                True  -> return K.NONE
           return $ K.OffsetFetchResponse
             { throttleTimeMs = 0
             , errorCode = K.NONE
@@ -217,11 +239,15 @@ handleOffsetFetch ServerContext{..} reqCtx req = E.handle (\(K.ErrorCodeExceptio
             --       on each topic. That is why we pass a "validate"
             --       function to it.
             -- FIXME: Better method than passing a "validate" function?
-            G.fetchOffsets group reqTopic $ \reqTopic_ -> do
-              -- [ACL] check [DESCRIBE TOPIC] for each topic
-              simpleAuthorize (toAuthorizableReqCtx reqCtx) authorizer Res_TOPIC reqTopic_.name AclOp_DESCRIBE >>= \case
-                False -> return K.TOPIC_AUTHORIZATION_FAILED
-                True  -> return K.NONE
+            case group_m of
+              -- FIXME: what error code should it return? 'K.UNKNOWN_TOPIC_OR_PARTITION'
+              --        crashes some tests...
+              Nothing    -> return (makeErrorTopicResponse K.NONE reqTopic)
+              Just group -> G.fetchOffsets group reqTopic $ \reqTopic_ -> do
+                -- [ACL] check [DESCRIBE TOPIC] for each topic
+                simpleAuthorize (toAuthorizableReqCtx reqCtx) authorizer Res_TOPIC reqTopic_.name AclOp_DESCRIBE >>= \case
+                  False -> return K.TOPIC_AUTHORIZATION_FAILED
+                  True  -> return K.NONE
           return $ K.OffsetFetchResponse
             { throttleTimeMs = 0
             , errorCode = K.NONE
@@ -240,7 +266,7 @@ handleOffsetFetch ServerContext{..} reqCtx req = E.handle (\(K.ErrorCodeExceptio
             K.OffsetFetchResponsePartition
             { partitionIndex  = idx
             , errorCode       = code
-            , metadata        = Nothing
+            , metadata        = Just ""
             , committedOffset = -1
             }
       }

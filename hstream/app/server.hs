@@ -2,10 +2,8 @@
 {-# LANGUAGE DataKinds           #-}
 {-# LANGUAGE GADTs               #-}
 {-# LANGUAGE LambdaCase          #-}
-{-# LANGUAGE NamedFieldPuns      #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings   #-}
-{-# LANGUAGE PatternSynonyms     #-}
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications    #-}
@@ -31,14 +29,13 @@ import           Network.HTTP.Client              (defaultManagerSettings,
                                                    newManager)
 import           System.Environment               (getArgs)
 import           System.IO                        (hPutStrLn, stderr)
-import           ZooKeeper                        (withResource,
-                                                   zookeeperResInit)
 
 import           HStream.Base                     (setupFatalSignalHandler)
 import           HStream.Common.Server.HashRing   (updateHashRing)
 import           HStream.Common.Server.MetaData   (TaskAllocation (..),
                                                    clusterStartTimeId)
 import           HStream.Common.Types             (getHStreamVersion)
+import           HStream.Common.ZookeeperClient   (withZookeeperClient)
 import           HStream.Exception
 import           HStream.Gossip                   (GossipContext (..),
                                                    defaultGossipOpts,
@@ -115,18 +112,19 @@ app config@ServerOpts{..} = do
                        logType _serverLogFlushImmediately
 
   bracket (openRocksDBHandle _querySnapshotPath) closeRocksDBHandle $ \db_m ->
-   case _metaStore of
-     ZkAddr addr -> do
-       let zkRes = zookeeperResInit addr Nothing 5000 Nothing 0
-       withResource zkRes $ \zk -> initHStreamZkPaths zk >> action (ZkHandle zk) db_m
-     RqAddr addr -> do
-       m <- newManager defaultManagerSettings
-       let rq = RHandle m addr
-       initHStreamRqTables rq
-       action (RLHandle rq) db_m
-     FileAddr addr -> do
-       initHStreamFileTables addr
-       action (FileHandle addr) db_m
+    case _metaStore of
+      ZkAddr addr -> do
+        withZookeeperClient addr 5000 $ \zkclient -> do
+          initHStreamZkPaths zkclient
+          action (ZKHandle zkclient) db_m
+      RqAddr addr -> do
+        m <- newManager defaultManagerSettings
+        let rq = RHandle m addr
+        initHStreamRqTables rq
+        action (RLHandle rq) db_m
+      FileAddr addr -> do
+        initHStreamFileTables addr
+        action (FileHandle addr) db_m
   where
     action h db_m = do
       hstreamVersion <- getHStreamVersion
@@ -202,12 +200,19 @@ serve sc@ServerContext{..} rpcOpts enableStreamV2 = do
 #endif
                 <> ", waiting for cluster to get ready"
         void $ forkIO $ do
-          void (readMVar (clusterReady gossipContext)) >> Log.info "Cluster is ready!"
+          void (readMVar (clusterReady gossipContext))
           readMVar (clusterInited gossipContext) >>= \case
             Gossip -> return ()
             _ -> do
               getProtoTimestamp >>= \x -> upsertMeta @Proto.Timestamp clusterStartTimeId x metaHandle
-              handle (\(_ :: RQLiteRowNotFound) -> return ()) $ deleteAllMeta @TaskAllocation metaHandle
+              -- FIXME: The following line is very delicate and can cause weird problems.
+              --        It was intended to re-allocate tasks after a server restart. However,
+              --        this should be done BEFORE any node serves any client request or
+              --        internal task. However, the current `serverOnStarted` is not
+              --        ensured to be called before serving outside.
+              -- TODO:  I do not have 100% confidence this is correct. So it should be
+              --        carefully investigated and tested.
+              -- handle (\(_ :: RQLiteRowNotFound) -> return ()) $ deleteAllMeta @TaskAllocation metaHandle
           -- recover tasks
           Log.info "recovering local io tasks"
           Cluster.recoverLocalTasks sc scIOWorker

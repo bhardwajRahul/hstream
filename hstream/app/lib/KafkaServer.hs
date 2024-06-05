@@ -4,7 +4,6 @@
 {-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings   #-}
-{-# LANGUAGE PatternSynonyms     #-}
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications    #-}
@@ -26,20 +25,18 @@ import           Data.Maybe                        (isJust)
 import qualified Data.Set                          as Set
 import qualified Data.Text                         as T
 import           Data.Text.Encoding                (decodeUtf8, encodeUtf8)
+import qualified Data.Vector                       as V
 import           Network.HTTP.Client               (defaultManagerSettings,
                                                     newManager)
 import           System.Environment                (getArgs)
 import           System.IO                         (hPutStrLn, stderr)
-import           ZooKeeper                         (withResource,
-                                                    zookeeperResInit)
-
-import qualified Data.Vector                       as V
 
 import           HStream.Base                      (setupFatalSignalHandler)
 import           HStream.Common.Server.HashRing    (updateHashRing)
 import qualified HStream.Common.Server.MetaData    as M
 import qualified HStream.Common.Server.TaskManager as TM
 import           HStream.Common.Types              (getHStreamVersion)
+import           HStream.Common.ZookeeperClient    (withZookeeperClient)
 import qualified HStream.Exception                 as HE
 import           HStream.Gossip                    (GossipContext (..),
                                                     defaultGossipOpts,
@@ -90,8 +87,8 @@ app config@ServerOpts{..} = do
                        logType _serverLogFlushImmediately
   case _metaStore of
     ZkAddr addr -> do
-      let zkRes = zookeeperResInit addr Nothing 5000 Nothing 0
-      withResource zkRes $ \zk -> M.initKafkaZkPaths zk >> action (ZkHandle zk)
+      withZookeeperClient addr 5000 $ \zkclient ->
+        M.initKafkaZkPaths zkclient >> action (ZKHandle zkclient)
     RqAddr addr -> do
       m <- newManager defaultManagerSettings
       let rq = RHandle m addr
@@ -132,7 +129,8 @@ app config@ServerOpts{..} = do
 
       -- Experimental features
       let usingCppServer = ExperimentalCppServer `elem` experimentalFeatures
-      Async.withAsync (serve serverContext netOpts usingCppServer) $ \a -> do
+          usingSparseOffset = ExperimentalSparseOffset `elem` experimentalFeatures
+      Async.withAsync (serve serverContext netOpts usingCppServer usingSparseOffset) $ \a -> do
         -- start gossip
         a1 <- startGossip _serverHost gossipContext
         Async.link2Only (const True) a a1
@@ -143,6 +141,7 @@ app config@ServerOpts{..} = do
                              _serverAdvertisedListeners
                              _listenersSecurityProtocolMap
                              usingCppServer
+                             usingSparseOffset
         forM_ as (Async.link2Only (const True) a)
         -- wait the default server
         waitGossipBoot gossipContext
@@ -156,8 +155,10 @@ app config@ServerOpts{..} = do
 serve :: ServerContext -> K.ServerOptions
       -> Bool
       -- ^ ExperimentalFeature: ExperimentalCppServer
+      -> Bool
+      -- ^ ExperimentalFeature: ExperimentalSparseOffset
       -> IO ()
-serve sc@ServerContext{..} netOpts usingCppServer = do
+serve sc@ServerContext{..} netOpts usingCppServer usingSparseOffset = do
   Log.i "************************"
   hPutStrLn stderr banner
   Log.i "************************"
@@ -175,7 +176,14 @@ serve sc@ServerContext{..} netOpts usingCppServer = do
               -- FIXME: Why need to call deleteAll here?
               -- Also in CI, getRqResult(common/hstream/HStream/MetaStore/RqliteUtils.hs) may throw a RQLiteUnspecifiedErr
               -- because the affected rows are more than 1, why that's invalid ?
-              deleteAllMeta @M.TaskAllocation metaHandle `catches` exceptionHandlers
+              -- FIXME: The following line is very delicate and can cause weird problems.
+              --        It was intended to re-allocate tasks after a server restart. However,
+              --        this should be done BEFORE any node serves any client request or
+              --        internal task. However, the current `serverOnStarted` is not
+              --        ensured to be called before serving outside.
+              -- TODO:  I do not have 100% confidence this is correct. So it should be
+              --        carefully investigated and tested.
+              -- deleteAllMeta @M.TaskAllocation metaHandle `catches` exceptionHandlers
 
           Log.info "starting task detector"
           TM.runTaskDetector $ TM.TaskDetector {
@@ -193,10 +201,15 @@ serve sc@ServerContext{..} netOpts usingCppServer = do
   Log.info $ "Starting"
         <> if isJust (K.serverSslOptions netOpts') then " secure " else " insecure "
         <> "kafka server..."
+  handlers <- if usingSparseOffset
+                 then do
+                   Log.warning "Using a experimental feature: SparseOffset"
+                   pure K.sparseOffsetHandlers
+                 else pure K.handlers
   if usingCppServer
      then do Log.warning "Using a still-in-development c++ kafka server!"
-             K.runCppServer netOpts' sc K.handlers
-     else K.runHsServer netOpts' sc K.unAuthedHandlers K.handlers
+             K.runCppServer netOpts' sc handlers
+     else K.runHsServer netOpts' sc K.unAuthedHandlers handlers
   where
    exceptionHandlers =
      [ Handler $ \(_ :: HE.RQLiteRowNotFound)    -> return ()
@@ -211,10 +224,12 @@ serveListeners
   -> ListenersSecurityProtocolMap
   -> Bool
   -- ^ ExperimentalFeature: ExperimentalCppServer
+  -> Bool
+  -- ^ ExperimentalFeature: ExperimentalSparseOffset
   -> IO [Async.Async ()]
 serveListeners sc netOpts
                securityMap listeners listenerSecurityMap
-               usingCppServer
+               usingCppServer usingSparseOffset
                = do
   let listeners' = [(k, v) | (k, vs) <- Map.toList listeners, v <- Set.toList vs]
   forM listeners' $ \(key, I.Listener{..}) -> Async.async $ do
@@ -243,10 +258,15 @@ serveListeners sc netOpts
             <> Log.build key <> ":"
             <> Log.build listenerAddress <> ":"
             <> Log.build listenerPort
+    handlers <- if usingSparseOffset
+                   then do
+                     Log.warning "Using a experimental feature: SparseOffset"
+                     pure K.sparseOffsetHandlers
+                   else pure K.handlers
     if usingCppServer
        then do Log.warning "Using a still-in-development c++ kafka server!"
-               K.runCppServer netOpts' sc' K.handlers
-       else K.runHsServer netOpts' sc' K.unAuthedHandlers K.handlers
+               K.runCppServer netOpts' sc' handlers
+       else K.runHsServer netOpts' sc' K.unAuthedHandlers handlers
 
 -------------------------------------------------------------------------------
 
@@ -254,5 +274,5 @@ serveListeners sc netOpts
 nodeChangeEventHandler
   :: MVar ServerContext -> Gossip.ServerState -> I.ServerNode -> IO ()
 nodeChangeEventHandler _scMVar Gossip.ServerDead I.ServerNode {..} = do
-  Log.info $ "(TODO) Handle Server Dead event: " <> Log.buildString' serverNodeId
+  Log.warning $ "(TODO) Handle Server Dead event: " <> Log.buildString' serverNodeId
 nodeChangeEventHandler _ _ _ = return ()

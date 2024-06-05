@@ -1,9 +1,12 @@
+#ifndef HSTREAM_SPARSE_OFFSET
 module HStream.Kafka.Server.Handler.Produce
   ( handleProduce
   , handleInitProducerId
   ) where
+#endif
 
 import qualified Control.Concurrent.Async              as Async
+import           Control.Exception
 import           Control.Monad
 import           Data.ByteString                       (ByteString)
 import qualified Data.ByteString                       as BS
@@ -22,12 +25,12 @@ import qualified HStream.Kafka.Common.RecordFormat     as K
 import           HStream.Kafka.Common.Resource
 import           HStream.Kafka.Server.Types            (ServerContext (..))
 import qualified HStream.Logger                        as Log
-import qualified HStream.Store                         as S
 import qualified HStream.Utils                         as U
 import qualified Kafka.Protocol.Encoding               as K
 import qualified Kafka.Protocol.Error                  as K
 import qualified Kafka.Protocol.Message                as K
 import qualified Kafka.Protocol.Service                as K
+import qualified Kafka.Storage                         as S
 
 -- acks: (FIXME: Currently we only support -1)
 --   0: The server will not send any response(this is the only case where the
@@ -43,12 +46,20 @@ import qualified Kafka.Protocol.Service                as K
 --       guarantees that the record will not be lost as long as at least one
 --       in-sync replica remains alive. This is the strongest available
 --       guarantee.
+#ifndef HSTREAM_SPARSE_OFFSET
 handleProduce
+#else
+handleProduceSparseOffset
+#endif
   :: ServerContext
   -> K.RequestContext
   -> K.ProduceRequest
   -> IO K.ProduceResponse
+#ifndef HSTREAM_SPARSE_OFFSET
 handleProduce ServerContext{..} _reqCtx req = do
+#else
+handleProduceSparseOffset ServerContext{..} _reqCtx req = do
+#endif
   -- TODO: handle request args: acks, timeoutMs
   let topicData = fromMaybe V.empty (K.unKaArray req.topicData)
   responses <- V.forM topicData $ \topic{- TopicProduceData -} -> do
@@ -71,9 +82,17 @@ handleProduce ServerContext{..} _reqCtx req = do
         M.totalProduceRequest
         (topic.name, T.pack . show $ partition.index) $ \counter ->
           void $ M.addCounter counter 1
-      let Just recordBytes = partition.recordBytes -- TODO: handle Nothing
-      Log.debug1 $ "Try to append to logid " <> Log.build logid
-                <> "(" <> Log.build partition.index <> ")"
+      let recordBytes =
+            fromMaybe (error "TODO: Receive empty recordBytes in ProduceRequest")
+                      (K.unRecordBytes partition.recordBytes)
+      -- Trace raw record bytes of the request
+      --
+      -- Note that the Show instance of RecordBytes type will only show the
+      -- length of the ByteString. So here we pass the ByteString to the Log
+      Log.trace $ "Received recordBytes: " <> Log.buildString' (recordBytes :: ByteString)
+      Log.debug1 $ "Try to append to "
+                <> Log.build topic.name <> ":" <> Log.build partition.index
+                <> ", log " <> Log.build logid
 
       -- [ACL] Generate response by the authorization result of the **topic**
       case isTopicAuthzed of
@@ -85,33 +104,6 @@ handleProduce ServerContext{..} _reqCtx req = do
                   , logStartOffset  = -1
                   }
         True -> do
-          -- FIXME: Block is too deep. Extract to a standalone function.
-          -- Wirte appends
-          (S.AppendCompletion{..}, offset) <-
-            appendRecords True scLDClient scOffsetManager
-                          (topic.name, partition.index) logid recordBytes
-
-          Log.debug1 $ "Append done " <> Log.build appendCompLogID
-                    <> ", lsn: " <> Log.build appendCompLSN
-                    <> ", start offset: " <> Log.build offset
-
-          -- TODO: performance improvements
-          --
-          -- For each append request after version 5, we need to read the oldest
-          -- offset of the log. This will cause critical performance problems.
-          --
-          --logStartOffset <-
-          --  if reqCtx.apiVersion >= 5
-          --     then do m_logStartOffset <- K.getOldestOffset scOffsetManager logid
-          --             case m_logStartOffset of
-          --               Just logStartOffset -> pure logStartOffset
-          --               Nothing -> do
-          --                 Log.fatal $ "Cannot get log start offset for logid "
-          --                          <> Log.build logid
-          --                 pure (-1)
-          --     else pure (-1)
-          let logStartOffset = (-1)
-
           -- TODO: PartitionProduceResponse.logAppendTimeMs
           --
           -- The timestamp returned by broker after appending the messages. If
@@ -120,13 +112,28 @@ handleProduce ServerContext{..} _reqCtx req = do
           -- local time when the messages are appended.
           --
           -- Currently, only support LogAppendTime
-          pure $ K.PartitionProduceResponse
-            { index           = partition.index
-            , errorCode       = K.NONE
-            , baseOffset      = offset
-            , logAppendTimeMs = appendCompTimestamp
-            , logStartOffset  = logStartOffset
-            }
+          catches (do
+            (appendCompTimestamp, offset) <-
+              appendRecords True scLDClient scOffsetManager
+                                 (topic.name, partition.index) logid recordBytes
+            pure $ K.PartitionProduceResponse
+              { index           = partition.index
+              , errorCode       = K.NONE
+              , baseOffset      = offset
+              , logAppendTimeMs = appendCompTimestamp
+              , logStartOffset  = (-1) -- TODO: getLogStartOffset
+              })
+            [ Handler (\(K.DecodeError (ec, msg))-> do
+                Log.debug1 $ "Append DecodeError " <> Log.buildString' ec
+                          <> ", " <> Log.buildString' msg
+                pure $ K.PartitionProduceResponse
+                  { index           = partition.index
+                  , errorCode       = ec
+                  , baseOffset      = (-1)
+                  , logAppendTimeMs = (-1)
+                  , logStartOffset  = (-1)
+                  })
+            ]
 
     pure $ K.TopicProduceResponse topic.name (K.KaArray $ Just partitionResponses)
 
@@ -156,11 +163,13 @@ appendRecords
   -> (Text, Int32)
   -> Word64
   -> ByteString
-  -> IO (S.AppendCompletion, Int64)
+  -> IO (Int64, Int64)  -- ^ Return (logAppendTimeMs, baseOffset)
 appendRecords shouldValidateCrc ldclient om (streamName, partition) logid bs = do
-  (batchLength, offsetOffsets) <- K.decodeBatchRecordsForProduce shouldValidateCrc bs
+  batch <- K.decodeRecordBatch shouldValidateCrc bs
+  let batchLength = batch.recordsCount
   when (batchLength < 1) $ error "Invalid batch length"
 
+#ifndef HSTREAM_SPARSE_OFFSET
   -- Offset wroten into storage is the max key in the batch, but return the min
   -- key to the client. This is because the usage of findKey.
   --
@@ -185,7 +194,7 @@ appendRecords shouldValidateCrc ldclient om (streamName, partition) logid bs = d
         appendKey = U.intToCBytesWithPadding o
         appendAttrs = Just [(S.KeyTypeFindKey, appendKey)]
 
-    K.unsafeAlterBatchRecordsBsForProduce (+ startOffset) offsetOffsets bs
+    K.unsafeUpdateRecordBatchBaseOffset bs (+ startOffset)
 
     -- FIXME unlikely overflow: convert batchLength from Int to Int32
     let storedRecord = K.runPut $ K.RecordFormat 0{- version -}
@@ -195,6 +204,8 @@ appendRecords shouldValidateCrc ldclient om (streamName, partition) logid bs = d
     Log.debug1 $ "Append key " <> Log.buildString' appendKey
               <> ", write offset " <> Log.build o
               <> ", batch length " <> Log.build batchLength
+              <> ", bytes " <> Log.build (BS.length bs)
+              <> ", stored bytes " <> Log.build (BS.length storedRecord)
     r <- M.observeWithLabel M.topicWriteStoreLatency streamName $
            S.appendCompressedBS ldclient logid storedRecord S.CompressionNone
                                 appendAttrs
@@ -203,4 +214,49 @@ appendRecords shouldValidateCrc ldclient om (streamName, partition) logid bs = d
       void $ M.addCounter counter (fromIntegral $ BS.length storedRecord)
     M.withLabel M.topicTotalAppendMessages partLabel $ \counter ->
       void $ M.addCounter counter (fromIntegral batchLength)
-    pure (r, startOffset)
+    Log.debug1 $ "Append done " <> Log.build r.appendCompLogID
+              <> ", lsn: " <> Log.build r.appendCompLSN
+              <> ", start offset: " <> Log.build startOffset
+    pure (r.appendCompTimestamp, startOffset)
+#else
+  -- FIXME unlikely overflow: convert batchLength from Int to Int32
+  let storedRecord = K.runPut $ K.RecordFormat 0{- version -}
+                                               0{- max offset -}
+                                               batchLength
+                                               (K.CompactBytes bs)
+  Log.debug1 $ "Append(SparseOffset) "
+            <> "batch length " <> Log.build batchLength
+            <> ", bytes " <> Log.build (BS.length bs)
+            <> ", stored bytes " <> Log.build (BS.length storedRecord)
+  r <- M.observeWithLabel M.topicWriteStoreLatency streamName $
+         S.appendCompressedBS ldclient logid storedRecord S.CompressionNone
+                              Nothing
+  let !partLabel = (streamName, T.pack . show $ partition)
+  M.withLabel M.topicTotalAppendBytes partLabel $ \counter ->
+    void $ M.addCounter counter (fromIntegral $ BS.length storedRecord)
+  M.withLabel M.topicTotalAppendMessages partLabel $ \counter ->
+    void $ M.addCounter counter (fromIntegral batchLength)
+  let startOffset = K.composeSparseOffset r.appendCompLSN 0
+  Log.debug1 $ "Append(SparseOffset) done " <> Log.build r.appendCompLogID
+            <> ", lsn: " <> Log.build r.appendCompLSN
+            <> ", start offset: " <> Log.build startOffset
+  pure (r.appendCompTimestamp, startOffset)
+#endif
+
+-- TODO: performance improvements
+--
+-- For each append request after version 5, we need to read the oldest
+-- offset of the log. This will cause critical performance problems.
+--
+--logStartOffset <-
+--  if reqCtx.apiVersion >= 5
+--     then do m_logStartOffset <- K.getOldestOffset scOffsetManager logid
+--             case m_logStartOffset of
+--               Just logStartOffset -> pure logStartOffset
+--               Nothing -> do
+--                 Log.fatal $ "Cannot get log start offset for logid "
+--                          <> Log.build logid
+--                 pure (-1)
+--     else pure (-1)
+getLogStartOffset :: IO Int64
+getLogStartOffset = pure (-1)
